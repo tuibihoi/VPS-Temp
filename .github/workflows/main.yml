@@ -68,8 +68,8 @@ jobs:
           Try-Run { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop }
           Try-Run { Add-MpPreference -ExclusionPath "C:\ProgramData","$env:LOCALAPPDATA","$env:USERPROFILE","$env:TEMP" }
 
-          # Stop background services that eat CPU/IO
-          foreach ($s in 'wuauserv','UsoSvc','DiagTrack','SysMain','WSearch','WerSvc','MapsBroker','DoSvc','BITS') {
+          # Only stop services that are safe (avoid touching networking/update-delivery services)
+          foreach ($s in 'DiagTrack','SysMain','WSearch','WerSvc') {
             Try-Run { Stop-Service $s -Force -ErrorAction Stop; Set-Service $s -StartupType Disabled }
           }
 
@@ -90,7 +90,7 @@ jobs:
           }
 
           Get-Process -Name 'Runner.Listener','Runner.Worker' -ErrorAction SilentlyContinue | ForEach-Object {
-            try { $_.PriorityClass = 'AboveNormal' } catch {}
+            try { $_.PriorityClass = 'High' } catch {}
           }
           Write-Host "System tuned."
 
@@ -122,7 +122,7 @@ jobs:
           if ($svc.Status -ne 'Running') { Start-Service Tailscale }
 
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          & $ts up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="gh-win-$env:GITHUB_RUN_ID" --unattended --accept-dns=false --accept-routes=false --reset
+          & $ts up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="gh-win-$env:GITHUB_RUN_ID" --unattended --accept-dns=false --accept-routes=false
           if ($LASTEXITCODE -ne 0) { throw "tailscale up failed: $LASTEXITCODE" }
 
           $ip = $null
@@ -231,7 +231,9 @@ jobs:
                 if ($LASTEXITCODE -ne 0) { throw "download failed: $LASTEXITCODE" }
               }
               Write-BootstrapLog "Installing OpenCode Desktop..."
-              $p = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru
+              $p = Start-Process -FilePath $installer -ArgumentList "/S" -PassThru
+              try { $p.PriorityClass = 'BelowNormal' } catch {}
+              $p.WaitForExit()
               if ($p.ExitCode -ne 0) { throw "installer exit code $($p.ExitCode)" }
               Start-Sleep -Seconds 2
               $exe = Find-OpenCodeExe
