@@ -6,315 +6,269 @@ on:
       session_minutes:
         description: "RDP session length in minutes (30-320)"
         required: true
-        type: number
-        default: 240
-      rdp_password:
-        description: "RDP password (min 8 chars, complex)"
-        required: true
-        type: string
-        default: "Vps@2025!Rdp#99"
+        default: "240"
 
 permissions:
   contents: read
 
-# Do NOT cancel a running RDP session when a new run is queued
 concurrency:
   group: temporary-windows-rdp
   cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   windows:
     runs-on: windows-2025
     timeout-minutes: 350
-    defaults:
-      run:
-        shell: pwsh
 
     steps:
-      - name: 1. Validate, tune system for performance
-        id: session
-        env:
-          INPUT_MINUTES: ${{ inputs.session_minutes || '240' }}
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Show runner image
+        shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-          $ProgressPreference = "SilentlyContinue"
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber
+          Write-Host "Runner image: $env:ImageOS / $env:ImageVersion"
 
-          $minutes = [int]$env:INPUT_MINUTES
+      - name: Validate session length
+        id: session
+        shell: powershell
+        run: |
+          $minutes = [int]"${{ inputs.session_minutes }}"
           if ($minutes -lt 30 -or $minutes -gt 320) { throw "session_minutes must be between 30 and 320." }
-          "minutes=$minutes" >> $env:GITHUB_OUTPUT
+          "minutes=$minutes" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-          $os = Get-CimInstance Win32_OperatingSystem
-          Write-Host "OS: $($os.Caption) Build $($os.BuildNumber) | Cores: $env:NUMBER_OF_PROCESSORS | Session: $minutes min"
+      - name: Harden runner for long interactive session
+        shell: powershell
+        run: |
+          # Prevent sleep/hibernate and reduce the chance of Windows Update restarting the VM.
+          powercfg /hibernate off | Out-Null
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change disk-timeout-ac 0
+          New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Force | Out-Null
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name NoAutoRebootWithLoggedOnUsers -PropertyType DWord -Value 1 -Force | Out-Null
 
-          # Pre-download OpenCode installer in background (parallel with Tailscale install)
-          $root = "C:\ProgramData\OpenCodeBootstrap"
-          New-Item -ItemType Directory -Path $root -Force | Out-Null
-          Start-Process -FilePath "curl.exe" -WindowStyle Hidden -ArgumentList @(
-            "--fail","--location","--silent","--retry","5","--retry-delay","2",
-            "--output","`"$root\opencode-desktop-win-x64.exe`"",
-            "https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-win-x64.exe"
-          )
-
-          function Try-Run([scriptblock]$b) { try { & $b } catch {} }
-
-          # Power: high performance, no sleep
-          Try-Run { powercfg /setactive SCHEME_MIN | Out-Null }
-          Try-Run { powercfg /hibernate off | Out-Null }
-          Try-Run { powercfg /change standby-timeout-ac 0 }
-          Try-Run { powercfg /change monitor-timeout-ac 0 }
-          Try-Run { powercfg /change disk-timeout-ac 0 }
-
-          # Defender: disable realtime scan (big CPU/disk win), fallback to exclusions
-          Try-Run { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop }
-          Try-Run { Add-MpPreference -ExclusionPath "C:\ProgramData","$env:LOCALAPPDATA","$env:USERPROFILE","$env:TEMP" }
-
-          # Only stop services that are safe (avoid touching networking/update-delivery services)
-          foreach ($s in 'DiagTrack','SysMain','WSearch','WerSvc') {
-            Try-Run { Stop-Service $s -Force -ErrorAction Stop; Set-Service $s -StartupType Disabled }
-          }
-
-          # Visual effects off (faster RDP rendering)
-          Try-Run {
-            $v = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects'
-            New-Item $v -Force | Out-Null
-            New-ItemProperty $v -Name VisualFXSetting -Value 2 -PropertyType DWord -Force | Out-Null
-          }
-          Try-Run {
-            $w = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
-            New-Item $w -Force | Out-Null
-            New-ItemProperty $w -Name NoAutoRebootWithLoggedOnUsers -Value 1 -PropertyType DWord -Force | Out-Null
-          }
-          Try-Run {
-            New-Item 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Server\ServerManager' -Force | Out-Null
-            New-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Server\ServerManager' -Name DoNotOpenAtLogon -Value 1 -PropertyType DWord -Force | Out-Null
-          }
-
+          # Keep the Actions worker responsive if an interactive build temporarily consumes CPU.
           Get-Process -Name 'Runner.Listener','Runner.Worker' -ErrorAction SilentlyContinue | ForEach-Object {
-            try { $_.PriorityClass = 'High' } catch {}
+            try { $_.PriorityClass = 'AboveNormal' } catch {}
           }
-          Write-Host "System tuned."
 
-      - name: 2. Install and connect Tailscale
-        id: tailscale
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          choco install tailscale -y --no-progress
+          $svc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+          if (-not $svc) { throw "Tailscale service was not installed." }
+          if ($svc.Status -ne 'Running') { Start-Service Tailscale }
+          Start-Sleep -Seconds 5
+
+      - name: Connect Tailscale
+        shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          $ErrorActionPreference = "Stop"
-          $ProgressPreference = "SilentlyContinue"
-
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) { throw "Missing repository secret: TAILSCALE_AUTHKEY" }
-
-          $installed = $false
-          try {
-            $meta = Invoke-RestMethod -Uri "https://pkgs.tailscale.com/stable/?mode=json" -TimeoutSec 10
-            $msiFile = $meta.MSIs.amd64
-            $msiPath = Join-Path $env:RUNNER_TEMP $msiFile
-            & curl.exe --fail --location --silent --show-error --retry 3 --retry-delay 1 --output $msiPath "https://pkgs.tailscale.com/stable/$msiFile"
-            if ($LASTEXITCODE -eq 0) {
-              $p = Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart TS_NOLAUNCH=true TS_UNATTENDEDMODE=always" -Wait -PassThru
-              if ($p.ExitCode -in 0,3010) { $installed = $true }
-            }
-          } catch { Write-Warning "MSI path failed: $($_.Exception.Message)" }
-
-          if (-not $installed) { choco install tailscale -y --no-progress }
-
-          $svc = Get-Service Tailscale -ErrorAction Stop
-          if ($svc.Status -ne 'Running') { Start-Service Tailscale }
-
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) { throw "Tailscale CLI not found." }
+
           & $ts up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="gh-win-$env:GITHUB_RUN_ID" --unattended --accept-dns=false --accept-routes=false
           if ($LASTEXITCODE -ne 0) { throw "tailscale up failed: $LASTEXITCODE" }
 
-          $ip = $null
-          for ($i = 0; $i -lt 20; $i++) {
-            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
-            if ($ip) { $ip = $ip.Trim(); break }
-            Start-Sleep -Milliseconds 500
-          }
-          if (-not $ip) { throw "No Tailscale IPv4 assigned." }
-          "ip=$ip" >> $env:GITHUB_OUTPUT
+          $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($ip)) { throw "Tailscale connected but no IPv4 address was assigned." }
           Write-Host "Tailscale IPv4: $ip"
 
-          # Diagnose direct vs DERP relay
-          & $ts netcheck 2>&1 | Select-Object -First 15 | ForEach-Object { Write-Host $_ }
-
-      - name: 3. Enable RDP and OpenCode autostart
+      - name: Enable secure RDP
         id: rdp
-        env:
-          TAILSCALE_IP: ${{ steps.tailscale.outputs.ip }}
-          INPUT_PASSWORD: ${{ inputs.rdp_password }}
-          SECRET_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-          $ProgressPreference = "SilentlyContinue"
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          $tailscaleIp = (& $ts ip -4 | Select-Object -First 1).Trim()
 
-          function Set-RegDwordSafe([string]$Path, [string]$Name, [int]$Value) {
-            try {
-              if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
-              New-ItemProperty -Path $Path -Name $Name -PropertyType DWord -Value $Value -Force | Out-Null
-            } catch {}
-          }
-
-          $tsPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
-          $rdpTcpPath = "$tsPath\WinStations\RDP-Tcp"
-          $policyTsPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-
-          Set-ItemProperty -Path $tsPath -Name 'fDenyTSConnections' -Value 0
-          Set-ItemProperty -Path $rdpTcpPath -Name 'UserAuthentication' -Value 1
-
-          # Lightweight RDP: no CPU-heavy AVC444, ~30fps, allow UDP+TCP
-          Set-RegDwordSafe $rdpTcpPath 'DWMFRAMEINTERVAL' 30
-          Set-RegDwordSafe $policyTsPath 'SelectTransport' 0
-          Set-RegDwordSafe $policyTsPath 'AVC444ModePreferred' 0
-          Set-RegDwordSafe $policyTsPath 'AVCHardwareEncodePreferred' 0
-          Set-RegDwordSafe $policyTsPath 'MaxIdleTime' 0
-          Set-RegDwordSafe $policyTsPath 'MaxDisconnectionTime' 0
-          Set-RegDwordSafe $policyTsPath 'fResetBroken' 0
-          Set-RegDwordSafe $policyTsPath 'fDisableWallpaper' 1
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
 
           Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-          foreach ($proto in 'TCP','UDP') {
-            Remove-NetFirewallRule -DisplayName "GH Tailscale RDP ($proto)" -ErrorAction SilentlyContinue
-            New-NetFirewallRule -DisplayName "GH Tailscale RDP ($proto)" -Direction Inbound -Action Allow `
-              -Protocol $proto -LocalPort 3389 -LocalAddress $env:TAILSCALE_IP -RemoteAddress 100.64.0.0/10 | Out-Null
+          Remove-NetFirewallRule -DisplayName "GitHub Actions Tailscale RDP" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "GitHub Actions Tailscale RDP" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -LocalAddress $tailscaleIp -RemoteAddress 100.64.0.0/10 | Out-Null
+
+          $user = "RunnerAdmin"
+          $password = "GhA!" + [guid]::NewGuid().ToString("N").Substring(0,20)
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $user -Password $securePassword
+          } else {
+            New-LocalUser -Name $user -Password $securePassword -FullName "Runner Admin" -Description "Temporary RDP user"
           }
 
-          # Password priority: secret > input > default
-          $user = "RunnerAdmin"
-          $password = if ($env:SECRET_PASSWORD) { $env:SECRET_PASSWORD }
-                      elseif ($env:INPUT_PASSWORD) { $env:INPUT_PASSWORD }
-                      else { "Vps@2025!Rdp#99" }
-
-          $secure = ConvertTo-SecureString $password -AsPlainText -Force
-          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) { Set-LocalUser -Name $user -Password $secure }
-          else { New-LocalUser -Name $user -Password $secure -FullName "Runner Admin" -Description "Temporary RDP user" -PasswordNeverExpires | Out-Null }
           Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
+          "username=$user" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "password=$password" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-          "username=$user" >> $env:GITHUB_OUTPUT
-          "password=$password" >> $env:GITHUB_OUTPUT
-
-          # OpenCode bootstrap (runs at RunnerAdmin logon)
+      - name: Prepare OpenCode Desktop auto-start
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
           $root = "C:\ProgramData\OpenCodeBootstrap"
           New-Item -ItemType Directory -Path $root -Force | Out-Null
 
+          # Do not download OpenCode during provisioning. Download/install it
+          # in the interactive RunnerAdmin session so RDP becomes ready immediately.
           $bootstrap = @'
           $ErrorActionPreference = "Stop"
+          Start-Sleep -Seconds 5
+
           $root = "C:\ProgramData\OpenCodeBootstrap"
           $installer = Join-Path $root "opencode-desktop-win-x64.exe"
           $log = Join-Path $root "bootstrap.log"
           $download = "https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-win-x64.exe"
 
-          function Write-BootstrapLog([string]$m) { Add-Content -Path $log -Value "$(Get-Date -Format o) $m" }
+          function Write-BootstrapLog([string]$Message) {
+            Add-Content -Path $log -Value "$(Get-Date -Format o) $Message"
+          }
 
           function Find-OpenCodeExe {
+            $candidates = @(
+              (Join-Path $env:LOCALAPPDATA "Programs\OpenCode\OpenCode.exe"),
+              (Join-Path $env:LOCALAPPDATA "Programs\opencode\OpenCode.exe"),
+              (Join-Path $env:LOCALAPPDATA "Programs\opencode-desktop\OpenCode.exe")
+            )
+
+            foreach ($candidate in $candidates) {
+              if (Test-Path $candidate) { return $candidate }
+            }
+
             $programs = Join-Path $env:LOCALAPPDATA "Programs"
             if (Test-Path $programs) {
-              $f = Get-ChildItem -Path $programs -Filter "OpenCode.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($f) { return $f.FullName }
+              $found = Get-ChildItem -Path $programs -Filter "OpenCode.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { return $found.FullName }
             }
+
             return $null
           }
 
           try {
-            $desktop = [Environment]::GetFolderPath("Desktop")
-            $stopCmd = Join-Path $desktop "Stop RDP Session.cmd"
-            if (-not (Test-Path $stopCmd)) {
-              Set-Content -Path $stopCmd -Value "@echo off`r`necho stop > `"$root\stop.signal`"" -Encoding ASCII
-            }
-
             $exe = Find-OpenCodeExe
+
             if (-not $exe) {
-              if (-not (Test-Path $installer) -or (Get-Item $installer).Length -lt 1MB) {
-                Write-BootstrapLog "Downloading OpenCode Desktop..."
-                & curl.exe --fail --location --silent --show-error --retry 5 --retry-delay 2 --output $installer $download
-                if ($LASTEXITCODE -ne 0) { throw "download failed: $LASTEXITCODE" }
+              Write-BootstrapLog "Downloading latest OpenCode Desktop..."
+              & curl.exe --fail --location --silent --show-error --retry 5 --retry-delay 2 --connect-timeout 20 --output $installer $download
+              if ($LASTEXITCODE -ne 0 -or -not (Test-Path $installer)) {
+                throw "OpenCode download failed with curl exit code $LASTEXITCODE."
               }
-              Write-BootstrapLog "Installing OpenCode Desktop..."
-              $p = Start-Process -FilePath $installer -ArgumentList "/S" -PassThru
-              try { $p.PriorityClass = 'BelowNormal' } catch {}
-              $p.WaitForExit()
-              if ($p.ExitCode -ne 0) { throw "installer exit code $($p.ExitCode)" }
-              Start-Sleep -Seconds 2
+
+              Write-BootstrapLog "Installing OpenCode Desktop silently..."
+              $proc = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru
+              if ($proc.ExitCode -ne 0) { throw "OpenCode installer exited with code $($proc.ExitCode)." }
+
+              Start-Sleep -Seconds 3
               $exe = Find-OpenCodeExe
             }
-            if (-not $exe) { throw "OpenCode.exe not found after install." }
+
+            if (-not $exe) { throw "OpenCode.exe was not found after installation." }
+
             if (-not (Get-Process -Name "OpenCode" -ErrorAction SilentlyContinue)) {
+              Write-BootstrapLog "Starting OpenCode Desktop: $exe"
               Start-Process -FilePath $exe -WorkingDirectory $env:USERPROFILE
             }
-          } catch { Write-BootstrapLog "ERROR: $($_.Exception.Message)" }
+          }
+          catch {
+            Write-BootstrapLog "ERROR: $($_.Exception.Message)"
+          }
           '@
+
           $bootstrapPath = Join-Path $root "Start-OpenCode.ps1"
           Set-Content -Path $bootstrapPath -Value $bootstrap -Encoding UTF8
 
-          $account = "$env:COMPUTERNAME\$user"
-          $action = New-ScheduledTaskAction -Execute "conhost.exe" `
-            -Argument "--headless powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$bootstrapPath`""
+          # GUI remains visible, but the PowerShell bootstrap has no console window.
+          $account = "$env:COMPUTERNAME\RunnerAdmin"
+          $action = New-ScheduledTaskAction `
+            -Execute "powershell.exe" `
+            -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$bootstrapPath`""
+
           $trigger = New-ScheduledTaskTrigger -AtLogOn -User $account
           $principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel Highest
           $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
-          Register-ScheduledTask -TaskName "OpenCode Desktop AutoStart" -Action $action -Trigger $trigger `
-            -Principal $principal -Settings $settings -Force | Out-Null
 
-      - name: 4. Show RDP connection info
+          Register-ScheduledTask `
+            -TaskName "OpenCode Desktop AutoStart" `
+            -Action $action `
+            -Trigger $trigger `
+            -Principal $principal `
+            -Settings $settings `
+            -Description "Download, silently install and launch OpenCode Desktop after RunnerAdmin signs in." `
+            -Force | Out-Null
+
+          Write-Host "OpenCode auto-start is ready. Download/install will run hidden after RDP login."
+      - name: Connection info
+        shell: powershell
         env:
-          TAILSCALE_IP: ${{ steps.tailscale.outputs.ip }}
           RDP_USER: ${{ steps.rdp.outputs.username }}
           RDP_PASSWORD: ${{ steps.rdp.outputs.password }}
         run: |
-          Write-Host "RDP Address : $env:TAILSCALE_IP"
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+          Write-Host "============================================================"
+          Write-Host "RDP address : $ip"
           Write-Host "Username    : $env:RDP_USER"
           Write-Host "Password    : $env:RDP_PASSWORD"
+          Write-Host "============================================================"
+          Write-Host "IMPORTANT: do not Restart/Shutdown Windows and do not disable network adapters."
+          Write-Host "Starting another run will be queued instead of cancelling this VPS."
+          Write-Host "OpenCode Desktop will install silently and open automatically after RDP login."
 
-          @"
-          ### Tailscale RDP Ready
-          | Thông tin | Giá trị |
-          | :--- | :--- |
-          | **IP** | ``$env:TAILSCALE_IP`` |
-          | **Hostname** | ``gh-win-$env:GITHUB_RUN_ID`` |
-          | **Username** | ``$env:RDP_USER`` |
-          | **Password** | ``$env:RDP_PASSWORD`` |
-
-          > Dùng xong: nháy đúp **Stop RDP Session.cmd** trên Desktop để tắt máy gọn gàng.
-          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-
-      - name: 5. Keep session alive and monitor
+      - name: Keep session available and monitor runner
+        shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-          SESSION_MINUTES: ${{ steps.session.outputs.minutes }}
-          TAILSCALE_IP: ${{ steps.tailscale.outputs.ip }}
         run: |
-          $ProgressPreference = "SilentlyContinue"
-          $deadline = (Get-Date).AddMinutes([int]$env:SESSION_MINUTES)
+          $minutes = [int]"${{ steps.session.outputs.minutes }}"
+          $deadline = (Get-Date).AddMinutes($minutes)
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          $stopSignal = "C:\ProgramData\OpenCodeBootstrap\stop.signal"
-          Write-Host "[READY] $env:TAILSCALE_IP | until $($deadline.ToString('HH:mm:ss'))"
+          $lastLog = (Get-Date).AddMinutes(-5)
 
-          $lastLog = Get-Date
           while ((Get-Date) -lt $deadline) {
-            if (Test-Path $stopSignal) { Write-Host "Stop signal received."; break }
-
-            $svc = Get-Service Tailscale -ErrorAction SilentlyContinue
-            if ($svc -and $svc.Status -ne 'Running') { Start-Service Tailscale; Start-Sleep 3 }
+            # Keep the Tailscale service alive without changing the machine's default route or DNS.
+            $svc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne 'Running') {
+              Write-Warning "Tailscale service stopped; restarting it."
+              Start-Service Tailscale
+              Start-Sleep -Seconds 3
+            }
 
             $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
             if ([string]::IsNullOrWhiteSpace($ip)) {
-              Write-Warning "Tailscale lost IP; reconnecting."
+              Write-Warning "Tailscale lost its IP; reconnecting."
               & $ts up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="gh-win-$env:GITHUB_RUN_ID" --unattended --accept-dns=false --accept-routes=false
+            }
+
+            # Give the GitHub Actions agent slightly higher priority than interactive build tools.
+            Get-Process -Name 'Runner.Listener','Runner.Worker' -ErrorAction SilentlyContinue | ForEach-Object {
+              try { $_.PriorityClass = 'AboveNormal' } catch {}
             }
 
             if (((Get-Date) - $lastLog).TotalMinutes -ge 5) {
               $os = Get-CimInstance Win32_OperatingSystem
               $freeMB = [math]::Round($os.FreePhysicalMemory / 1024)
+              $cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
               $remaining = [math]::Ceiling(($deadline - (Get-Date)).TotalMinutes)
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] remaining=${remaining}m freeRAM=${freeMB}MB"
+              $github443 = Test-NetConnection github.com -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
+              Write-Host "Heartbeat: remaining=${remaining}m, freeRAM=${freeMB}MB, CPU=${cpu}%, GitHub443=$github443, TailscaleIP=$ip"
               $lastLog = Get-Date
             }
-            Start-Sleep -Seconds 20
+
+            Start-Sleep -Seconds 30
           }
 
-      - name: 6. Disconnect Tailscale
+      - name: Disconnect Tailscale
         if: always()
+        shell: powershell
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           if (Test-Path $ts) { & $ts logout }
