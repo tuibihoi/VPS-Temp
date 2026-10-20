@@ -97,7 +97,7 @@ jobs:
           New-NetFirewallRule -DisplayName "GitHub Actions Tailscale RDP" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -LocalAddress $tailscaleIp -RemoteAddress 100.64.0.0/10 | Out-Null
 
           $user = "RunnerAdmin"
-          $password = "GhA!" + [guid]::NewGuid().ToString("N").Substring(0,20)
+          $password = 'Vps@2025!Rdp#99'
           $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
 
           if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
@@ -109,7 +109,6 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
           "username=$user" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "password=$password" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Prepare OpenCode Desktop auto-start
         shell: powershell
@@ -206,18 +205,18 @@ jobs:
             -Force | Out-Null
 
           Write-Host "OpenCode auto-start is ready. Download/install will run hidden after RDP login."
+
       - name: Connection info
         shell: powershell
         env:
           RDP_USER: ${{ steps.rdp.outputs.username }}
-          RDP_PASSWORD: ${{ steps.rdp.outputs.password }}
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
           Write-Host "============================================================"
           Write-Host "RDP address : $ip"
           Write-Host "Username    : $env:RDP_USER"
-          Write-Host "Password    : $env:RDP_PASSWORD"
+          Write-Host "Password    : Vps@2025!Rdp#99"
           Write-Host "============================================================"
           Write-Host "IMPORTANT: do not Restart/Shutdown Windows and do not disable network adapters."
           Write-Host "Starting another run will be queued instead of cancelling this VPS."
